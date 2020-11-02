@@ -29,7 +29,7 @@
 
 #if !defined(unix) && !defined(__unix__) && !defined(__unix) && \
     !defined(__APPLE__) && !defined(_WIN32) && !defined(__QNXNTO__) && \
-    !defined(__HAIKU__) && !defined(__midipix__)
+    !defined(__HAIKU__) && !defined(__midipix__) && !defined(__PS3__)
 #error "This module only works on Unix and Windows, see MBEDTLS_NET_C in config.h"
 #endif
 
@@ -84,7 +84,13 @@ static int wsa_init_done = 0;
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <unistd.h>
+#ifdef __PS3__
+#include <netdb.h>
+#include <netex/errno.h>
+#include <sys/select.h>
+#else
 #include <signal.h>
+#endif
 #include <fcntl.h>
 #include <netdb.h>
 #include <errno.h>
@@ -124,7 +130,7 @@ static int net_prepare( void )
         wsa_init_done = 1;
     }
 #else
-#if !defined(EFIX64) && !defined(EFI32)
+#if !defined(EFIX64) && !defined(EFI32) && !defined(__PS3__)
     signal( SIGPIPE, SIG_IGN );
 #endif
 #endif
@@ -145,7 +151,32 @@ void mbedtls_net_init( mbedtls_net_context *ctx )
 int mbedtls_net_connect( mbedtls_net_context *ctx, const char *host,
                          const char *port, int proto )
 {
-    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+   int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+#ifdef __PS3__
+   // the PS3 does not have addrinfo, so must use gethostbyname
+   struct hostent* server = gethostbyname(host);
+   if (server == NULL)
+      return( MBEDTLS_ERR_NET_UNKNOWN_HOST );
+
+   /* Try the sockaddrs until a connection succeeds */
+   ret = MBEDTLS_ERR_NET_UNKNOWN_HOST;
+
+   ctx->fd = (int)socket( AF_INET, SOCK_STREAM, 0);
+   if (ctx->fd < 0)
+   {
+      return MBEDTLS_ERR_NET_SOCKET_FAILED;
+   }
+   struct sockaddr_in serv_addr;
+   memset(&serv_addr, 0, sizeof(serv_addr));
+   serv_addr.sin_family = AF_INET;
+   memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+   serv_addr.sin_port = htons(port);
+   if (connect(ctx->fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0)
+      return 0; // success
+
+   close(ctx->fd);
+   ret = MBEDTLS_ERR_NET_CONNECT_FAILED;
+#else
     struct addrinfo hints, *addr_list, *cur;
 
     if( ( ret = net_prepare() ) != 0 )
@@ -183,6 +214,7 @@ int mbedtls_net_connect( mbedtls_net_context *ctx, const char *host,
     }
 
     freeaddrinfo( addr_list );
+#endif
 
     return( ret );
 }
@@ -192,6 +224,9 @@ int mbedtls_net_connect( mbedtls_net_context *ctx, const char *host,
  */
 int mbedtls_net_bind( mbedtls_net_context *ctx, const char *bind_ip, const char *port, int proto )
 {
+#ifdef __PS3__
+   return MBEDTLS_ERR_NET_BIND_FAILED; // not implemented for PS3
+#else
     int n, ret;
     struct addrinfo hints, *addr_list, *cur;
 
@@ -256,7 +291,7 @@ int mbedtls_net_bind( mbedtls_net_context *ctx, const char *bind_ip, const char 
     freeaddrinfo( addr_list );
 
     return( ret );
-
+#endif
 }
 
 #if ( defined(_WIN32) || defined(_WIN32_WCE) ) && !defined(EFIX64) && \
@@ -280,16 +315,20 @@ static int net_would_block( const mbedtls_net_context *ctx )
 static int net_would_block( const mbedtls_net_context *ctx )
 {
     int err = errno;
-
     /*
-     * Never return 'WOULD BLOCK' on a blocking socket
-     */
+    * Never return 'WOULD BLOCK' on a blocking socket
+    */
+#ifdef __PS3__
+    // PS3 cannot get blocking status with fcntl
+    char* buf;
+    if ( recv( ctx->fd, buf, 0, MSG_DONTWAIT | MSG_PEEK) != SYS_NET_EWOULDBLOCK)
+#else
     if( ( fcntl( ctx->fd, F_GETFL ) & O_NONBLOCK ) != O_NONBLOCK )
+#endif
     {
         errno = err;
         return( 0 );
     }
-
     switch( errno = err )
     {
 #if defined EAGAIN
@@ -311,6 +350,9 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
                         mbedtls_net_context *client_ctx,
                         void *client_ip, size_t buf_size, size_t *ip_len )
 {
+#ifdef __PS3__
+   return MBEDTLS_ERR_NET_ACCEPT_FAILED;
+#else
     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
     int type;
 
@@ -421,6 +463,7 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
     }
 
     return( 0 );
+#endif
 }
 
 /*
@@ -428,6 +471,9 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
  */
 int mbedtls_net_set_block( mbedtls_net_context *ctx )
 {
+#ifdef __PS3__
+   return -1;
+#else
 #if ( defined(_WIN32) || defined(_WIN32_WCE) ) && !defined(EFIX64) && \
     !defined(EFI32)
     u_long n = 0;
@@ -435,10 +481,14 @@ int mbedtls_net_set_block( mbedtls_net_context *ctx )
 #else
     return( fcntl( ctx->fd, F_SETFL, fcntl( ctx->fd, F_GETFL ) & ~O_NONBLOCK ) );
 #endif
+#endif // PS3
 }
 
 int mbedtls_net_set_nonblock( mbedtls_net_context *ctx )
 {
+#ifdef __PS3__
+   return -1;
+#else
 #if ( defined(_WIN32) || defined(_WIN32_WCE) ) && !defined(EFIX64) && \
     !defined(EFI32)
     u_long n = 1;
@@ -446,6 +496,7 @@ int mbedtls_net_set_nonblock( mbedtls_net_context *ctx )
 #else
     return( fcntl( ctx->fd, F_SETFL, fcntl( ctx->fd, F_GETFL ) | O_NONBLOCK ) );
 #endif
+#endif // ps3
 }
 
 /*
@@ -557,9 +608,10 @@ int mbedtls_net_recv( void *ctx, unsigned char *buf, size_t len )
         if( WSAGetLastError() == WSAECONNRESET )
             return( MBEDTLS_ERR_NET_CONN_RESET );
 #else
+#ifndef __PS3__
         if( errno == EPIPE || errno == ECONNRESET )
             return( MBEDTLS_ERR_NET_CONN_RESET );
-
+#endif
         if( errno == EINTR )
             return( MBEDTLS_ERR_SSL_WANT_READ );
 #endif
@@ -637,9 +689,10 @@ int mbedtls_net_send( void *ctx, const unsigned char *buf, size_t len )
         if( WSAGetLastError() == WSAECONNRESET )
             return( MBEDTLS_ERR_NET_CONN_RESET );
 #else
+#ifndef __PS3__
         if( errno == EPIPE || errno == ECONNRESET )
             return( MBEDTLS_ERR_NET_CONN_RESET );
-
+#endif
         if( errno == EINTR )
             return( MBEDTLS_ERR_SSL_WANT_WRITE );
 #endif
